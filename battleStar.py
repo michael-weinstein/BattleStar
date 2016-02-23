@@ -32,7 +32,10 @@ class CheckArgs():  #class that checks arguments and ultimately returns a valida
         parser.add_argument("-m", "--emptyCellMarker", help = "Marker for blank cells.", default = "")
         parser.add_argument("-o", "--outputFile", help = "Specify the output file name.", default = "output.txt")
         parser.add_argument("-k", "--pickleOut", help = "Output to a Pandas pickle instead of a delimited text file.", action = 'store_true')
+        parser.add_argument("-1", "--filter1RAM", help = "Specify (in GB) how much RAM to allocate for every parallel instance of filter 1", default = 4, type = int)
+        parser.add_argument("--directToFilter1", help = "Skip prefilter step (assume it has already been done")
         rawArgs = parser.parse_args()
+        self.doPrefilter = True
         self.doFilter1 = True
         self.doCount = True
         self.doFilter2 = True
@@ -76,7 +79,10 @@ class CheckArgs():  #class that checks arguments and ultimately returns a valida
                 if item in self.contextExclusion:
                     raise RuntimeError("Error, " + item + " is included in both the requirement and exclusion lists.")
         self.sampleSize = rawArgs.sampleSize
-        self.minRepresentation = rawArgs.minRepresentation
+        minRepresentation = rawArgs.minRepresentation
+        if minRepresentation < 0 or minRepresentation > 100:
+            raise RuntimeError("Minimum representation must be between 0 and 100 percent.  We got: " + str(minRepresentation))
+        self.minRepresentation = minRepresentation
         self.maxParallelJobs = rawArgs.maxParallelJobs
         if rawArgs.scratchFolder:
             if os.path.isdir(rawArgs.scratchFolder):
@@ -85,13 +91,21 @@ class CheckArgs():  #class that checks arguments and ultimately returns a valida
                 raise RuntimeError("Specified scratch folder does not exist. " + rawArgs.scratchFolder)
         else:
             self.scratchFolder = ""
+        if rawArgs.directToFilter1:
+            self.doPrefilter = False
+            if os.path.isdir(rawArgs.directToFilter1):
+                self.tempdir = rawArgs.directToFilter1
+            else:
+                raise RuntimeError("Specified temporary directory for continuing does not exist: " + rawArgs.directToFilter1)
         if rawArgs.directToCount:
+            self.doPrefilter = False
             self.doFilter1 = False
             if os.path.isdir(rawArgs.directToCount):
                 self.tempdir = rawArgs.directToCount
             else:
                 raise RuntimeError("Specified temporary directory for continuing does not exist: " + rawArgs.directToCount)
         if rawArgs.directToFilter2:
+            self.doPrefilter = False
             self.doFilter1 = False
             self.doCount = False
             if os.path.isdir(rawArgs.directToFilter2):
@@ -99,6 +113,7 @@ class CheckArgs():  #class that checks arguments and ultimately returns a valida
             else:
                 raise RuntimeError("Specified temporary directory for continuing does not exist: " + rawArgs.directToFilter2)
         if rawArgs.directToFinalBuild:
+            self.doPrefilter = False
             self.doFilter1 = False
             self.doCount = False
             self.doFilter2 = False
@@ -137,6 +152,10 @@ class CheckArgs():  #class that checks arguments and ultimately returns a valida
             if not yesAnswer("Overwrite existing file?"):
                 quit("By your command")
         self.outputFile = outputFile
+        filter1RAM = rawArgs.filter1RAM
+        if filter1RAM < 1 or filter1RAM > 16:
+            raise RuntimeError("Excessive RAM requested for first filter job.")
+        self.filter1RAM = filter1RAM
 
 def displaySplash():
     print("   ___       _   _   _      __ _             ")
@@ -149,25 +168,25 @@ def displaySplash():
     print("email: [myfirstname].[mylastname] AT ucla.edu")
 
 def createTempDir():  #makes a temporary directory for this run.  Completions will clock out here and results will be reported back to it.
-    if args.verbose:
-        print ("Creating temporary directory")
-    import re
-    import os
-    import datetime
-    successful = False
-    while not successful:
-        currenttime = datetime.datetime.now()
-        currenttime = str(currenttime)
-        currenttime = re.sub(r'\W','',currenttime)
-        tempdir = args.scratchFolder + '.battlestar' + currenttime
-        if os.path.isdir(tempdir):
-            continue
-        try:
-            os.mkdir(tempdir)
-        except OSError:
-            continue
-        successful = True
-    os.mkdir(tempdir + os.sep + "filter1")
+    if args.verbose:  #If the user wants reports on what we're doing...
+        print ("Creating temporary directory")  #tell them
+    import re  #import the library for regular expressions
+    import os  #import the library for OS system calls
+    import datetime  #import the library for date and time usage
+    successful = False  #initialize a value
+    while not successful:  #until the value of success is true
+        currenttime = datetime.datetime.now()  #get the current date and time
+        currenttime = str(currenttime)  #convert the datetime object to a string
+        currenttime = re.sub(r'\W','',currenttime) #get rid of any characters that are not numbers, letters, or underscores by replacing them with nothing 
+        tempdir = args.scratchFolder + '.battlestar' + currenttime  #create a string with the name of my temporary directory
+        if os.path.isdir(tempdir):  #if there's already a directory with the name of our desired tempdir
+            continue  #go back and try again
+        try:  
+            os.mkdir(tempdir)  #try making the temporary directory
+        except OSError:  #if it doesn't work
+            continue  #go back and try again
+        successful = True  #otherwise, set successful to true, return to the start of the loop, and exit
+    os.mkdir(tempdir + os.sep + "filter1")  #make a bunch of subdirectories in the tempdir 
     os.mkdir(tempdir + os.sep + "filter2")
     os.mkdir(tempdir + os.sep + "loci")
     os.mkdir(tempdir + os.sep + "lociGather")
@@ -177,95 +196,174 @@ def createTempDir():  #makes a temporary directory for this run.  Completions wi
     os.mkdir(tempdir + os.sep + "bashFiles")
     os.mkdir(tempdir + os.sep + "finalParts")
     os.mkdir(tempdir + os.sep + "finalPartsClockOut")
+    os.mkdir(tempdir + os.sep + "prefilter")
+    os.mkdir(tempdir + os.sep + "prefilterClockOut")
     return tempdir
     
-def getFilter1FileList():
-    import os
-    if args.directory:
-        directory = args.directory
-    else:
-        directory = os.getcwd()
-    if not directory.endswith(os.sep):
-        directory += os.sep
-    rawFileList = os.listdir(directory)
-    filteredFileList = []
-    for file in rawFileList:
-        if file.endswith(".ratio"):
-            filteredFileList.append(directory + file)
-    if len(filteredFileList) < args.maxParallelJobs:
-        parallelJobs = len(filteredFileList)
-    fileJobList = []
+def getFilter1FileList():  #function to get a list of files for our first filter
+    import os  #import the library for making os system calls
+    import operator
+    if args.directory:  #if the user specified a directory to work on
+        directory = args.directory  #use that directory
+    else:  #otherwise
+        directory = os.getcwd()  #use the current directory
+    if not directory.endswith(os.sep):  #if the directory does not end with a slash or backslash (depending on operating system)
+        directory += os.sep #if not, add one
+    rawFileList = os.listdir(directory)  #get a list of files in that directory
+    for i in range(0,len(rawFileList)):
+        rawFileList[i] = [rawFileList[i], os.path.getsize(directory + rawFileList[i])]
+    rawFileList = sorted(rawFileList, key = operator.itemgetter(1), reverse = True)
+    for i in range(0,len(rawFileList)):
+        rawFileList[i] = rawFileList[i][0]
+    filteredFileList = []  #initialize an empty list for storing the files we are interested in
+    for file in rawFileList:  #go through the files in the directory
+        if file.endswith(".ratio"):  #if they end with .ratio
+            filteredFileList.append(directory + file)  #add them on to the list of files we are interested in
+    if len(filteredFileList) < args.maxParallelJobs:  #if there are fewer files than permitted parallel jobs
+        parallelJobs = len(filteredFileList) #set the limit on parallel jobs to the number of files
+    fileJobList = []  #initialize an empty list of jobs to parallelize filter 1
     for i in range(0,parallelJobs):
-        fileJobList.append([])
-    for i in range(0,len(filteredFileList)):
-        fileJobList[i % parallelJobs].append(filteredFileList[i])
-    return fileJobList
+        fileJobList.append([])  #this loop puts a number of empty lists in our job list equal to our number of parallel jobs
+    for i in range(0,len(filteredFileList)):  #for every file we need to filter at the step
+        fileJobList[i % parallelJobs].append(filteredFileList[i])  #add files to our job list for each job 
+    return fileJobList  #return the list of job files, where each element is a list of files for a job to handle
 
-def runFilter1(fileList, tempdir):
-    import os
-    if not os.path.isdir("schedulerOutput"):
-        os.mkdir("schedulerOutput")
-    wrapperRunnerName = tempdir + os.sep + "bashFiles" + os.sep + "wrapper.sh"
-    wrapperRunner = open(wrapperRunnerName, 'w')
-    wrapperRunner.write("#!/bin/bash\n")
-    wrapperRunner.write(pythonInterpreterAbsolutePath + " raptor.py " + "--tempdir " + tempdir + " --clockOutDir " + tempdir + os.sep + "filter1ClockOut")
-    wrapperRunner.close()
-    clockOutFlush(tempdir + os.sep + "filter1ClockOut")
-    for i in range(0,len(fileList)):
-        arguments = {"--fileList" : ",".join(fileList[i]),
-                     "--minCoverage" : str(args.minCoverage),
-                     "--tempdir" : tempdir,
-                     "--contextRequirement" : ",".join(args.contextRequirement),
-                     "--contextExclusion" : ",".join(args.contextExclusion),
-                     "--sampleSize" : str(args.sampleSize)}
-        argumentList = []
-        for key in list(arguments.keys()):
-            if arguments[key]:
-                argumentList.append(key + " " + arguments[key])
-        argumentString = " ".join(argumentList)
-        if i == 0:
+
+def runPrefilter(fileList, tempdir):  #function to run a less optimized prefilter on very large files to avoid memory errors from running things in RAM
+    import os  #import the library for making system calls
+    prefilterFileList = []
+    for line in fileList:
+        for file in line:        
+            if os.path.getsize(file) > (args.filter1RAM * 1000000000) / 10:
+                prefilterFileList.append(file)
+    if not prefilterFileList:
+        return fileList
+    prefilterFiles = []
+    if len(prefilterFileList) > args.maxParallelJobs:
+        parallelJobs = args.maxParallelJobs
+    else:
+        parallelJobs = len(prefilterFileList)
+    for i in range(0, parallelJobs):
+        prefilterFiles.append([])
+    for i in range(0, len(prefilterFileList)):
+        prefilterFiles[i % parallelJobs].append(prefilterFileList[i])
+    if args.doPrefilter:
+        if not os.path.isdir("schedulerOutput"):  #if there is no directory for grabbing the scheduler output
+            os.mkdir("schedulerOutput")  #create one
+        wrapperRunnerName = tempdir + os.sep + "bashFiles" + os.sep + "wrapper.sh"  #define a filename for running the parallel job wrapper
+        wrapperRunner = open(wrapperRunnerName, 'w')  #open the bash file for running the wrapper
+        wrapperRunner.write("#!/bin/bash\n")  #write the first line to the wrapper's bash file
+        wrapperRunner.write(pythonInterpreterAbsolutePath + " raptor.py " + "--tempdir " + tempdir + " --clockOutDir " + tempdir + os.sep + "prefilterClockOut")  #write the actual instructions to the wrapper's bash file
+        wrapperRunner.close()  #close the wrapper bash file
+        clockOutFlush(tempdir + os.sep + "prefilterClockOut")  #make sure that there are no pre-existing clock out files in the clockout directory
+        for i in range(0,len(prefilterFiles)):  #go through the list of job files
+            arguments = {"--fileList" : ",".join(prefilterFiles[i]), #create a comma separated string of all the files for this job  
+                         "--minCoverage" : str(args.minCoverage),  #grab the minimum coverage requirement from arguments
+                         "--tempdir" : tempdir,  #set the temporary directory
+                         "--contextRequirement" : ",".join(args.contextRequirement),  #set the context requirements 
+                         "--contextExclusion" : ",".join(args.contextExclusion)}
+            argumentList = []  #initialize an empty argument list
+            for key in list(arguments.keys()):  #iterate over keys in arguments
+                if arguments[key]:  #if there is a value set for that key
+                    argumentList.append(key + " " + arguments[key])  #add the key and value to the arguments list
+            argumentString = " ".join(argumentList)  #create the argument string by joining the argument list with a space separating the elements
+            if i == 0:  #if this is the first parallel job
+                if args.verbose:  #if the user wants to see output 
+                    argumentString += " -v"  #add the verbose argument to this one
+                thisNodesJob = pythonInterpreterAbsolutePath + " refinery.py " + argumentString  #set this node's job to the commandline we just created
+            else:  #for all other (not the first) parallel jobs
+                bashFileName = tempdir + os.sep + "bashFiles" + os.sep + str(i) + ".sh"  #make a string with the name of the bash file containing the command for the job
+                bashFile = open(bashFileName, 'w')  #open that bash file
+                bashFile.write("#!/bin/bash\n")  #write the first line of the bash file
+                bashFile.write(pythonInterpreterAbsolutePath + " refinery.py " + argumentString)  #write the actual command for the program
+                bashFile.close()  #close the bash file
+        jobRange = "1-" + str(len(prefilterFiles)-1) + " "  #creates an empty string for job range
+        if len(prefilterFiles) > 1:
+            command = "qsub -cwd -V -N Refinery -l h_data=1G,time=23:59:00 -e " + os.getcwd() +  "/schedulerOutput/ -o " + os.getcwd() + "/schedulerOutput/ " + "-t " + jobRange + wrapperRunnerName  #create a command line to submit an array job to SGE
             if args.verbose:
-                argumentString += " -v"
-            thisNodesJob = pythonInterpreterAbsolutePath + " viper.py " + argumentString
-        else:
-            bashFileName = tempdir + os.sep + "bashFiles" + os.sep + str(i) + ".sh"
-            bashFile = open(bashFileName, 'w')
-            bashFile.write("#!/bin/bash\n")
-            bashFile.write(pythonInterpreterAbsolutePath + " viper.py " + argumentString)
-            bashFile.close()
-    jobRange = "1-" + str(len(fileList)) + " "
-    command = "qsub -cwd -V -N Vipers -l h_data=4G,time=23:59:00 -e " + os.getcwd() +  "/schedulerOutput/ -o " + os.getcwd() + "/schedulerOutput/ " + "-t " + jobRange + wrapperRunnerName
-    if args.verbose:
-        print("BASH " + command)
-    os.system(command)
+                print("BASH " + command)
+            os.system(command)  #run the qsub command to create an array job for filter 1
+        if args.verbose:
+            print("Starting the job on this node.")
+            print("BASH " + thisNodesJob)
+        os.system(thisNodesJob)  #run the commandline for this node's job
+        if args.verbose:
+            print("Monitoring other node prefilter jobs.")
+        if len(prefilterFiles) > 1:
+            monitorJobs(tempdir + os.sep + "prefilterClockOut", len(prefilterFiles))  #start the job monitor
+    for i in range(0, len(fileList)):
+        for j in range(0, len(fileList[i])):
+            if fileList[i][j] in prefilterFileList:
+                fileList[i][j] = tempdir + os.sep + "prefilter" + os.sep + fileList[i][j].split(os.sep)[-1] + ".prefilter.ratio"
+    return fileList
+
+def runFilter1(fileList, tempdir):  #function to run the first filter (on items that are strictly within a single file)
+    import os  #import the library for making system calls
+    if not os.path.isdir("schedulerOutput"):  #if there is no directory for grabbing the scheduler output
+        os.mkdir("schedulerOutput")  #create one
+    wrapperRunnerName = tempdir + os.sep + "bashFiles" + os.sep + "wrapper.sh"  #define a filename for running the parallel job wrapper
+    wrapperRunner = open(wrapperRunnerName, 'w')  #open the bash file for running the wrapper
+    wrapperRunner.write("#!/bin/bash\n")  #write the first line to the wrapper's bash file
+    wrapperRunner.write(pythonInterpreterAbsolutePath + " raptor.py " + "--tempdir " + tempdir + " --clockOutDir " + tempdir + os.sep + "filter1ClockOut")  #write the actual instructions to the wrapper's bash file
+    wrapperRunner.close()  #close the wrapper bash file
+    clockOutFlush(tempdir + os.sep + "filter1ClockOut")  #make sure that there are no pre-existing clock out files in the clockout directory
+    for i in range(0,len(fileList)):  #go through the list of job files
+        arguments = {"--fileList" : ",".join(fileList[i]), #create a comma separated string of all the files for this job  
+                     "--minCoverage" : str(args.minCoverage),  #grab the minimum coverage requirement from arguments
+                     "--tempdir" : tempdir,  #set the temporary directory
+                     "--contextRequirement" : ",".join(args.contextRequirement),  #set the context requirements 
+                     "--contextExclusion" : ",".join(args.contextExclusion),  #set the context exclusion
+                     "--sampleSize" : str(args.sampleSize)}
+        argumentList = []  #initialize an empty argument list
+        for key in list(arguments.keys()):  #iterate over keys in arguments
+            if arguments[key]:  #if there is a value set for that key
+                argumentList.append(key + " " + arguments[key])  #add the key and value to the arguments list
+        argumentString = " ".join(argumentList)  #create the argument string by joining the argument list with a space separating the elements
+        if i == 0:  #if this is the first parallel job
+            if args.verbose:  #if the user wants to see output 
+                argumentString += " -v"  #add the verbose argument to this one
+            thisNodesJob = pythonInterpreterAbsolutePath + " viper.py " + argumentString  #set this node's job to the commandline we just created
+        else:  #for all other (not the first) parallel jobs
+            bashFileName = tempdir + os.sep + "bashFiles" + os.sep + str(i) + ".sh"  #make a string with the name of the bash file containing the command for the job
+            bashFile = open(bashFileName, 'w')  #open that bash file
+            bashFile.write("#!/bin/bash\n")  #write the first line of the bash file
+            bashFile.write(pythonInterpreterAbsolutePath + " viper.py " + argumentString + " -v")  #write the actual command for the program
+            bashFile.close()  #close the bash file
+    jobRange = "1-" + str(len(fileList)) + " "  #creates an empty string for job range
+    if len(fileList) > 1:
+        command = "qsub -cwd -V -N Vipers -l h_data=" + str(args.filter1RAM) + "G,time=23:59:00 -e " + os.getcwd() +  "/schedulerOutput/ -o " + os.getcwd() + "/schedulerOutput/ " + "-t " + jobRange + wrapperRunnerName  #create a command line to submit an array job to SGE
+        if args.verbose:
+            print("BASH " + command)
+        os.system(command)  #run the qsub command to create an array job for filter 1
     if args.verbose:
         print("Starting the job on this node.")
         print("BASH " + thisNodesJob)
-    os.system(thisNodesJob)
+    os.system(thisNodesJob)  #run the commandline for this node's job
     if args.verbose:
         print("Monitoring other node filtering and extraction jobs.")
-    monitorJobs(tempdir + os.sep + "filter1ClockOut", len(fileList))
+    if len(fileList) > 1:
+        monitorJobs(tempdir + os.sep + "filter1ClockOut", len(fileList))  #start the job monitor
     
 def monitorJobs(clockOutDirectory, jobCount):
     import os
     import time
-    done = False
-    completed = 1
-    jobList = []
-    for i in range(1,jobCount):
-        jobList.append([i,False])
+    done = False  #initialize this variable to False
+    completed = 1  #one job should already be done on this one
+    jobList = []  #initialize an empty list for jobList
+    for i in range(1,jobCount):  #for each job we have
+        jobList.append([i,False])  #add a list to the list of jobs that has job number and job's done status (initially false)
     while not done:
         if args.verbose:
-            print("Completed " + str(completed) + " of " + str(jobCount) + " jobs.       ", end = "\r")
-        for i in range(0,len(jobList)):
-            if not jobList[i][1]:
-                if os.path.isfile(clockOutDirectory + os.sep + str(jobList[i][0])):
-                    jobList[i][1] = True
-                    completed += 1
-                    if completed == len(jobList) + 1:
-                        done = True
+            print("Completed " + str(completed) + " of " + str(jobCount) + " jobs.       ", end = "\r")  #display a counter without writing a new line
+        for i in range(0,len(jobList)):  #for each job in the list of parallel jobs
+            if not jobList[i][1]:  #if it is not already marked as done
+                if os.path.isfile(clockOutDirectory + os.sep + str(jobList[i][0])):  #check if the job of that number (in index 0) now has a clock out file
+                    jobList[i][1] = True  #set the done marker to true
+                    completed += 1  #add one more job completed to our count
+                    if completed == len(jobList) + 1:  #if our completed count is equal to our number of jobs
+                        done = True  #set done to true
                         break
-        time.sleep(1)
+        time.sleep(1)  #after going through all the files, wait a second before starting again
     if args.verbose:
         print("Completed " + str(completed) + " of " + str(jobCount) + " jobs.       ")
         
@@ -344,16 +442,18 @@ def runFilter2(fileList, tempdir):
             bashFile.close()
     jobRange = "1-" + str(len(fileList)) + " "
     command = "qsub -cwd -V -N CylonRaiders -l h_data=4G,time=23:59:00 -e " + os.getcwd() +  "/schedulerOutput/ -o " + os.getcwd() + "/schedulerOutput/ " + "-t " + jobRange + wrapperRunnerName
-    if args.verbose:
-        print("BASH " + command)
-    os.system(command)
+    if len(fileList) > 1:
+        if args.verbose:
+            print("BASH " + command)
+        os.system(command)
     if args.verbose:
         print("Starting the job on this node.")
         print("BASH " + thisNodesJob)
     os.system(thisNodesJob)
     if args.verbose:
         print("Monitoring other nodes representation filtering jobs.")
-    monitorJobs(tempdir + os.sep + "filter2ClockOut", len(fileList))
+    if len(fileList) > 1:
+        monitorJobs(tempdir + os.sep + "filter2ClockOut", len(fileList))
 
 def cleanUp(tempdir):
     import shutil
@@ -607,20 +707,21 @@ def main():
     import datetime
     import pandas
     global args
-    args = CheckArgs()
+    args = CheckArgs()  #get validated arguments in the args object
+    if args.verbose:   #if the user has allowed output
+        displaySplash()  #show the startup screen
     if args.verbose:
-        displaySplash()
-    if args.verbose:
-        start = datetime.datetime.now()
-    if args.tempdir:
-        tempdir = args.tempdir
-    else:
-        tempdir = createTempDir()
-    if args.doFilter1:
-        jobFilesList = getFilter1FileList()
-        if not jobFilesList:
-            raise RuntimeError("No data files to process for filter 1.")
-        runFilter1(jobFilesList, tempdir)
+        start = datetime.datetime.now()  #log the start time
+    if args.tempdir:  #if the user specified a temporary directory
+        tempdir = args.tempdir  #use that as the temporary directory
+    else:  #if none was specified
+        tempdir = createTempDir()  #create one
+    if args.doFilter1:  #if the user did not specify skipping the first filter
+        jobFilesList = getFilter1FileList()  #get a list of files to work on for this step
+        if not jobFilesList:  #if the jobFilesList is empty
+            raise RuntimeError("No data files to process for filter 1.")  #quit and report the error
+        jobFilesList = runPrefilter(jobFilesList, tempdir)
+        runFilter1(jobFilesList, tempdir)  #otherwise, run the first filter (the one that looks just a data within a file)
     bashFileFlush(tempdir)
     if args.doCount:
         countRepresentation(tempdir)

@@ -80,7 +80,7 @@ def removeTrailingZeros(string):
         string = string.rstrip("0")
         string = string.rstrip(".")
     return string
-    
+
 class DataLine(object):
     
     def __init__(self, rawLine, header, delimiter = "\t"):
@@ -97,10 +97,6 @@ class DataLine(object):
             self.line[self.header.indexOf("ct_count")] = int(removeTrailingZeros(self.line[self.header.indexOf("ct_count")]))
             self.line[self.header.indexOf("rev_g_count")] = int(removeTrailingZeros(self.line[self.header.indexOf("rev_g_count")]))
             self.line[self.header.indexOf("rev_ga_count")] = int(removeTrailingZeros(self.line[self.header.indexOf("rev_ga_count")]))
-            if self.line[self.header.indexOf("ratio")] > 1.0:
-                self.line[self.header.indexOf("ratio")] = 1.0
-            if self.line[self.header.indexOf("ratio")] < 0:
-                self.line[self.header.indexOf("ratio")] = 0
         except (ValueError, IndexError):
             self.isBadLine = True
         else:
@@ -130,59 +126,47 @@ class DataLine(object):
         return self.rawLine
         
 def processFile(fileName):
-    import pickle
     import os
-    file = open(fileName, 'r')
-    wholeFile = file.read()
-    file.close()
-    wholeFile.strip()
-    wholeFileLines = wholeFile.split("\n")
-    del wholeFile
-    acceptedLines = []
-    observedLociList = []
-    totalLines = len(wholeFileLines)
-    for i in range(0, totalLines):
-        if args.verbose and i % 10000 == 0:
-            print("Processed " + str(i) + " of " + str(totalLines) + " lines.  Accepted " + str(len(acceptedLines)) + " lines.                ", end = "\r")
-        if i == 0:
-            headerLine = HeaderLine(wholeFileLines[i])
-        else:
-            rawDataLine = wholeFileLines[i].strip()
-            if rawDataLine:
-                dataLine = DataLine(rawDataLine, headerLine)
-                if dataLine.isBadLine:
-                    continue
-                if dataLine.hasSufficientCoverage(args.minCoverage) and dataLine.hasCorrectContext(args.contextRequirement, args.contextExclusion) :
-                    acceptedLines.append(dataLine)
-                    observedLociList.append(dataLine.locusString)
-    del wholeFileLines
+    inputFile = open(fileName, 'r')
+    outputFileName = args.tempdir + os.sep + "prefilter" + os.sep + fileName.split(os.sep)[-1] + ".prefilter"
+    outputFile = open(outputFileName, 'w')
     if args.verbose:
-        print("Processed " + str(i) + " of " + str(totalLines) + " lines.  Accepted " + str(len(acceptedLines)) + " lines.                ", end = "\r")
-        # print("Chr   Pos     Ratio")
-        # for i in range(0,args.sampleSize):
-        #     print(acceptedLines[i].ratioLine)
-        # print("Chr   Pos     Subgroup")
-        # for i in range(0,args.sampleSize):
-        #     print(observedLociList[i])
-    dataPickleName = fileName + ".data.pkl"
-    locusPickleName = fileName + ".loci.pkl"
-    acceptedLineMatrix = []
-    for line in acceptedLines:
-        acceptedLineMatrix.append(line.ratioLine)
-    del acceptedLines
-    if args.tempdir:
-        if not os.path.isdir(args.tempdir):
-            raise RuntimeError("Unable to find temporary directory: " + args.tempdir)
-        dataPickleName = args.tempdir + os.sep + "filter1" + os.sep + dataPickleName.split(os.sep)[-1]
-        locusPickleName = args.tempdir + os.sep + "loci" + os.sep + locusPickleName.split(os.sep)[-1]
+        print("Started input and output files.")
+    line = inputFile.readline()
+    line = line.strip()
+    if line:
+        headerLine = HeaderLine(line)
+        if args.verbose:
+            print("Read header line.")
     else:
-        tempdir = ""
-    dataPickle = open(dataPickleName, 'wb')
-    pickle.dump(acceptedLineMatrix, dataPickle)
-    dataPickle.close()
-    locusPickle = open(locusPickleName, 'wb')
-    pickle.dump(observedLociList, locusPickle)
-    locusPickle.close()
+        raise RuntimeError("File appears to have an empty header line.  Unable to identify columns.")
+    outputFile.write(line + "\n")
+    progress = 1
+    accepted = 0
+    while line:
+        if args.verbose and (progress % 10000 == 0 or progress == 1):
+            print("Processed " + str(progress) + " raw lines.  Accepted " + str(accepted) + " lines.                    ", end = "\r")
+        line = inputFile.readline()
+        if not line:
+            break
+        line = line.strip()
+        if not line:
+            line = True
+            continue
+        dataLine = DataLine(line, headerLine)
+        if dataLine.isBadLine:
+            progress += 1
+            continue
+        if dataLine.hasSufficientCoverage(args.minCoverage) and dataLine.hasCorrectContext(args.contextRequirement, args.contextExclusion) :
+            outputFile.write(line + "\n")
+            accepted += 1
+        progress += 1
+    if args.verbose:
+        print("Processed " + str(progress) + " raw lines.  Accepted " + str(accepted) + " lines.                    ")
+        print("Closing working files.")
+    inputFile.close()
+    outputFile.close()
+    os.rename(outputFileName, outputFileName + ".ratio")
     
 def main():
     import pickle
@@ -198,7 +182,7 @@ def main():
             processFile(fileName)
     if args.verbose:
         runtime = datetime.datetime.now() - start
-        print("Coverage filtering and data extraction process complete in " + str(runtime))
+        print("Context and coverage filter on large file complete in " + str(runtime))
         
 main()
                 

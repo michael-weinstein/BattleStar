@@ -33,21 +33,21 @@ class CheckArgs():  #class that checks arguments and ultimately returns a valida
             raise RuntimeError("No clockout directory given.")
                 
 def main():
-    import os
-    global args
-    args = CheckArgs()
+    import os  #import the library for making os system calls
+    global args  #declare args as a global
+    args = CheckArgs()  #get an object containing validated arguments
     try:
-        thisJob = int(os.environ["SGE_TASK_ID"])   #Yes, yes, this is a fertile job and we will thrive.  We will rule over all this job and we will call it... thisJob.
-    except KeyError:   #I think we should call it your unhandled exception
-        raise RuntimeError("Unable to find a valid task ID in OS environment variables.")  #Arghhh... curse your sudden but inevitable betrayal!
-    tempdir = args.tempdir
-    if not tempdir.endswith(os.sep):
-        tempdir += os.sep
-    bashFilePath = tempdir + "bashFiles" + os.sep + str(thisJob) + ".sh"
-    jobStatus = os.system("bash " + bashFilePath)
-    if jobStatus == 0:
-        touchFilePath = args.clockOutDir + str(thisJob)
-        touchFile = open(touchFilePath, 'w')
-        touchFile.close()
+        thisJob = int(os.environ["SGE_TASK_ID"])   #get the array job number from environmental variables
+    except KeyError:  #if it cannot get that value
+        raise RuntimeError("Unable to find a valid task ID in OS environment variables.")   #something is wrong so quit
+    tempdir = args.tempdir  #get the tempdir from arguments
+    if not tempdir.endswith(os.sep):  #if it does not end with a separator
+        tempdir += os.sep  #add one
+    bashFilePath = tempdir + "bashFiles" + os.sep + str(thisJob) + ".sh"  #initialize a string with our bash file name based upon our job number
+    jobStatus = os.system("bash " + bashFilePath)  #run the bash file we just identified and set jobStatus to its exit status
+    if jobStatus == 0:  #if the job finished successfully
+        touchFilePath = args.clockOutDir + str(thisJob)  #define our clockout file
+        touchFile = open(touchFilePath, 'w')  #create our clockout file
+        touchFile.close()  #close it without writing anything
     
 main()
